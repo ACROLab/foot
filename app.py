@@ -2183,6 +2183,7 @@ class FrameAnalysis:
     orientation_corrected: bool=False
     checker_scale_excluded: bool=False
     partial_border_diagnostics: dict | None=None
+    reference_transfer_evidence: dict | None=None
 
     def json(self):
         return {f.name:getattr(self,f.name) for f in fields(self) if f.name not in ('image','rectified_image','mask_image')}
@@ -2274,11 +2275,146 @@ def analyze_frame(bgr,kind,view_id):
         return FrameAnalysis(view_id,kind,False,None,str(exc),None,False,None,0,im)
 
 
+# ========================================================================
+# L02 Contours + L05 Homography + L07 RANSAC
+# 측면 사진: 같은 사진 묶음에서 A4 바깥 경계가 독립 검출된 기준 사진을
+# 이용해 다른 측면 사진의 검은 칸 중심점을 2D 대응. 인쇄 칸 크기 가정 없음.
+# ========================================================================
+
+def transfer_reference_corners(ref_image, ref_corners, image, old_corners):
+    """Return (new A4 quad, evidence) only if >=5 feature points corroborate it.
+
+    Feature correspondences are matched in the approximate rectified A4 frame,
+    then re-fitted in raw image coordinates with RANSAC.  Require spatial
+    coverage and independent paper/floor edge contrast on ALL FOUR edges.
+    A transfer is not independent physical page-border verification and never
+    uses the person's known foot size. No learned models or new markers.
+    """
+    source = resize_image(ref_image)
+    target = resize_image(image)
+    refq = order_quad(np.asarray(ref_corners, np.float32))
+    oldq = order_quad(np.asarray(old_corners, np.float32))
+    source_squares = detect_squares(source)
+    target_squares = detect_squares(target)
+    if len(target_squares) < 5:
+        target_squares = detect_squares_adaptive(target)
+    if len(source_squares) < 5 or len(target_squares) < 5:
+        return None
+    _, src_h, src_dim = rectify(source,refq)
+    _, tgt_h, tgt_dim = rectify(target,oldq)
+    if src_dim != (297.0,210.0) or tgt_dim != (297.0,210.0):
+        return None
+    src_pts = np.float32([s['center'] for s in source_squares]).reshape(-1,1,2)
+    tgt_pts = np.float32([s['center'] for s in target_squares]).reshape(-1,1,2)
+    a = cv2.perspectiveTransform(src_pts,src_h).reshape(-1,2)
+    b = cv2.perspectiveTransform(tgt_pts,tgt_h).reshape(-1,2)
+    distances = np.linalg.norm(b[:,None,:]-a[None,:,:],axis=2)
+    matches=[];used_src=set();used_tgt=set()
+    for i,j in sorted(np.ndindex(distances.shape),key=lambda ij:float(distances[ij])):
+        if distances[i,j]>70.:break
+        if i in used_tgt or j in used_src:continue
+        used_src.add(j);used_tgt.add(i)
+        matches.append((i,j))
+    if len(matches)<5:
+        return None
+    src_idx=[j for i,j in matches]
+    tgt_idx=[i for i,j in matches]
+    reference_xy=a[src_idx]
+    if np.ptp(reference_xy[:,0])<230 or np.ptp(reference_xy[:,1])<130:
+        return None
+    obj_xy=src_pts[src_idx,0]
+    img_xy=tgt_pts[tgt_idx,0]
+    hom,inlier=cv2.findHomography(obj_xy,img_xy,cv2.RANSAC,5.0,maxIters=2000)
+    if hom is None or inlier is None or int(inlier.sum())<5:
+        return None
+    h=np.asarray(hom,dtype=np.float64)
+    if abs(np.linalg.det(h))<1e-10:return None
+    projected=cv2.perspectiveTransform(refq.reshape(-1,1,2),hom).reshape(4,2)
+    try: candidate=validate_a4_quadrilateral(projected,target.shape)
+    except DetectionFailure:return None
+    # Prevent far-off and folded/perspective-degenerate proposals.
+    H,W=target.shape[:2]
+    if (candidate.min()<4 or candidate[:,0].max()>W-5 or candidate[:,1].max()>H-5):
+        return None
+    if cv2.contourArea(candidate)<=0:
+        return None
+    area=cv2.contourArea(candidate)/max(cv2.contourArea(oldq.astype(np.float32)),1.)
+    shifts=np.linalg.norm(candidate-oldq,axis=1)
+    if not .82<area<1.23 or np.max(shifts)>80:
+        return None
+    predicted=cv2.perspectiveTransform(obj_xy.reshape(-1,1,2),hom).reshape(-1,2)
+    residual=np.linalg.norm(predicted-img_xy,axis=1)
+    valid=np.asarray(inlier).reshape(-1)>0
+    if float(np.median(residual[valid]))>3.5:
+        return None
+    # Distinct from repeated checker matching: the projected paper boundary
+    # must be independently supported by original photo paper/floor contrast.
+    support=_edge_contrast(target,candidate)
+    if support is None or min(support)<.30 or np.median(support)<.45:
+        return None
+    return candidate,dict(status='cross_photo_supported_not_independent',
+                          method='l02_checker_centers_l05_homography_l07_ransac',
+                          inliers=int(inlier.sum()),matches=len(matches),
+                          median_reprojection_px=round(float(np.median(residual[valid])),2),
+                          observed_boundary_support=[round(float(v),2) for v in support],
+                          original_candidate_shift_px=[round(float(v),1) for v in shifts])
+
+
+def improve_side_with_verified_reference(items,sides):
+    """Revise only reference-transfer candidates verified by separate cues."""
+    verified=[f for f in items if f.kind=='side' and f.outer_border_verified
+              and f.paper_corners is not None and f.accepted]
+    if not verified or not sides:
+        return items
+    verified.sort(key=lambda f:(f.detected_squares,f.corner_score or 0),reverse=True)
+    reference=verified[0]
+    index=int(reference.view_id.split('-')[-1])-1
+    source=sides[index]
+    for item in items:
+        if item.kind!='side' or item.outer_border_verified or item.paper_corners is None:
+            continue
+        i=int(item.view_id.split('-')[-1])-1
+        match=transfer_reference_corners(source,reference.paper_corners,
+                                         sides[i],item.paper_corners)
+        if match is None: continue
+        quad,evidence=match
+        target=resize_image(sides[i])
+        rect,_,dim=rectify(target,quad)
+        if dim[0]<=dim[1]:continue
+        mask=foot_mask(rect)
+        rect,mask,rotated=normalize_measurement_orientation(rect,mask,'side')
+        mm,reason=side_length(mask)
+        if mm is None: continue
+        # Require the transfer itself to be supported by checkerboard geometry
+        # after rectification; do not certify it as an independently observed A4.
+        checker=audit_checker_squares(rect).json()
+        if checker.get('status') != 'supported':continue
+        item.mm=round(mm,2)
+        item.accepted=True
+        item.reason=reason
+        item.paper_corners=quad.round(1).tolist()
+        item.paper_method='cross_photo_checker_ransac_unverified_outer_border'
+        item.outer_border_verified=False
+        item.reference_transfer_evidence={'reference':reference.view_id, **evidence}
+        item.rectified_image=rect
+        item.mask_image=mask
+        item.mask_pixels=int(np.count_nonzero(mask))
+        item.orientation_corrected=rotated
+        item.checker_quality=checker
+        original=target.copy()
+        cv2.polylines(original,[np.rint(np.asarray(item.paper_corners,np.float32)).astype(np.int32)],True,(30,225,60),3)
+        cv2.putText(original,'A4: checker RANSAC + photo edge checks (provisional)',
+                    (10,30),cv2.FONT_HERSHEY_SIMPLEX,.48,(255,255,255),2,cv2.LINE_AA)
+        item.image=original
+    return items
+
+
 def analyze_batch(tops,sides):
     """All photos contribute to ONE physically scoped measurement per kind."""
     items=[]
     for i,im in enumerate(tops):items.append(analyze_frame(im,'top',f'top-{i+1}'))
     for i,im in enumerate(sides):items.append(analyze_frame(im,'side',f'side-{i+1}'))
+    improve_side_with_verified_reference(items,sides)
     # Check repeated printed-square sizes across photos without using physical
     # foot measurements or a made-up checker print template. Diagnostic only.
     # CheckerQuality는 위의 체스보드 검사 구역에서 이미 정의됨.
@@ -2949,7 +3085,7 @@ const orbText=rel?.status==='relative_geometry_consistent'
     : rel ? ' · L07 사진 간 특징점 대응 근거 부족'
     : matching.anchor===f.view_id ? ' · L07 사진 간 비교 기준(실제 A4 모서리 정답 아님)' : '';
 
-diagnostic.textContent=(f.paper_method||'no A4')+(f.outer_border_verified?' · 종이 경계 증거 있음':' · A4 바깥 경계 검증 미완료')+' / 검은 칸 '+f.detected_squares+'개'+squareInfo+fitted+exposureText+edgeText+shapeText+orbText+(String(f.paper_method||'').startsWith('adaptive_')?' · 밝기 적응형 보조 검출':'')+(f.orientation_corrected?' · 촬영 방향 180° 자동 정렬':'');el.append(diagnostic);el.append(t);g.append(el)}
+diagnostic.textContent=(f.paper_method||'no A4')+(f.reference_transfer_evidence ? ` · 다른 사진 ${f.reference_transfer_evidence.reference}와의 검은 칸 RANSAC ${f.reference_transfer_evidence.inliers}점 검증(실제 A4 외곽 정답 아님)` : '')+(f.outer_border_verified?' · 종이 경계 증거 있음':' · A4 바깥 경계 검증 미완료')+' / 검은 칸 '+f.detected_squares+'개'+squareInfo+fitted+exposureText+edgeText+shapeText+orbText+(String(f.paper_method||'').startsWith('adaptive_')?' · 밝기 적응형 보조 검출':'')+(f.orientation_corrected?' · 촬영 방향 180° 자동 정렬':'');el.append(diagnostic);el.append(t);g.append(el)}
 document.getElementById('result').style.display='block';document.getElementById('result').scrollIntoView({behavior:'smooth'});
 }catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent='자동 분석 시작';}
 });
@@ -3173,6 +3309,35 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_data(500,json.dumps({'error':'서버 내부 처리 오류가 발생했습니다. 서버 로그를 확인해 주세요.'},ensure_ascii=False),'application/json; charset=utf-8')
 
 if __name__=='__main__':
+    # Presentation-day diagnostic: actually run the YOLO checkpoint (if the
+    # ultralytics environment is installed), instead of confusing file SHA256
+    # verification with inference. This does not require starting a web server.
+    import sys
+    if '--test-yolo' in sys.argv:
+        try:
+            ix=sys.argv.index('--test-yolo')
+            photo=Path(sys.argv[ix+1])
+            image=cv2.imread(str(photo),cv2.IMREAD_COLOR)
+            if image is None:raise ValueError(f'사진 파일을 읽을 수 없습니다: {photo}')
+            status=arch_capability()
+            print('YOLO 환경 확인:',json.dumps(status,ensure_ascii=False),flush=True)
+            value=predict_arch_checked(resize_image(image))
+            output=value.pop('preview_bgr',None)
+            if output is not None:
+                name=photo.with_name(photo.stem+'_yolo_result.jpg')
+                if not cv2.imwrite(str(name),output):
+                    raise RuntimeError('YOLO 결과 이미지를 저장하지 못했습니다.')
+                value['result_image']=str(name)
+            print('YOLO 실제 추론 결과:',json.dumps(value,ensure_ascii=False),flush=True)
+        except Exception as exc:
+            print('YOLO 실제 실행 실패:',str(exc),flush=True)
+            print('설치: python -m pip install -r requirements-yolo.txt',flush=True)
+            raise SystemExit(1)
+        raise SystemExit(0)
+    if '--check-yolo' in sys.argv:
+        status=arch_capability()
+        print(json.dumps(status,ensure_ascii=False,indent=2))
+        raise SystemExit(0 if status['status']=='ready_to_attempt' else 1)
     host=os.getenv('HOST','0.0.0.0');port=int(os.getenv('PORT','8000'))
     print(f'FootFrame Lecture-CV + YOLO: http://{host}:{port}',flush=True)
     ThreadingHTTPServer((host,port),RequestHandler).serve_forever()
