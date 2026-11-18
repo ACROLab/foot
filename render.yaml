@@ -3,10 +3,21 @@ services:
     name: footframe-2d
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    # Keep the 2D site available on free 512MB hosts. On >=2GB Render
+    # instances set FOOTFRAME_ENABLE_YOLO=1 and rebuild to install YOLO.
+    buildCommand: >-
+      pip install -r requirements.txt &&
+      if [ "$FOOTFRAME_ENABLE_YOLO" = "1" ]; then
+        pip install --extra-index-url https://download.pytorch.org/whl/cpu torch torchvision &&
+        pip install -r requirements-yolo.txt;
+      fi
     startCommand: python app.py
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: '3.11.11'
+      - key: FOOTFRAME_ENABLE_YOLO
+        value: '0'
       - key: OPENBLAS_NUM_THREADS
         value: '1'
       - key: OMP_NUM_THREADS

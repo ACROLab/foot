@@ -9,6 +9,7 @@ from __future__ import annotations
 # 공통 라이브러리 — 강의의 OpenCV 처리 함수들이 같은 모듈을 공유합니다.
 import base64
 import hashlib
+import importlib.util
 import html
 import json
 import os
@@ -2718,6 +2719,58 @@ def model_file() -> Path:
         return path
 
 
+def _memory_limit_mb() -> int | None:
+    """Read the container cgroup limit without importing PyTorch.
+
+    YOLOv8m-seg needs substantially more than the 512 MB available to
+    free Render services. A RAM guard prevents a YOLO request from killing
+    the otherwise working 2D CV web process. It does not claim that an
+    instance above this limit will automatically have enough RAM.
+    """
+    for filename in ('/sys/fs/cgroup/memory.max',
+                     '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+        try:
+            raw=Path(filename).read_text(encoding='ascii').strip()
+            size=int(raw)
+            if 0 < size < (1 << 55):
+                return size // (1024*1024)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def arch_capability() -> dict:
+    """Configuration checks only; does NOT claim to have run YOLO inference."""
+    chunks=sorted(MODEL_DIR.glob('best.pt.part[0-9][0-9]'))
+    required=[f'best.pt.part{i:02d}' for i in range(1,8)]
+    segments_ok=[f.name for f in chunks] == required and SHA256_FILE.is_file()
+    installed=importlib.util.find_spec('ultralytics') is not None
+    ram=_memory_limit_mb()
+    min_ram=1536  # conservative runtime gate, NOT a measured RAM requirement
+    if not segments_ok:
+        code='model_parts_missing'
+        explanation='YOLO 모델 조각 7개 또는 SHA256 파일을 찾지 못했습니다.'
+    elif not installed:
+        code='dependency_missing'
+        explanation='ultralytics가 설치되지 않았습니다. YOLO용 Render 빌드 설정을 확인하세요.'
+    elif ram is not None and ram < min_ram and os.getenv('FOOTFRAME_YOLO_ALLOW_LOW_MEMORY')!='1':
+        code='memory_insufficient'
+        explanation=f'서버 메모리 한도 {ram}MB에서는 PyTorch YOLO로 인해 서버가 종료될 수 있습니다. 별도 2GB 이상 인스턴스가 필요합니다.'
+    else:
+        code='ready_to_attempt'
+        explanation='파일 및 라이브러리 조건 확인. 실제 모델 추론 성공 여부는 예측 실행 결과로 확인해야 합니다.'
+    return dict(status=code, message=explanation, installed=installed,
+                model_parts_present=segments_ok, memory_limit_mb=ram,
+                actual_inference_verified=False, model_task='segment')
+
+
+def predict_arch_checked(image: np.ndarray) -> dict:
+    gate=arch_capability()
+    if gate['status']!='ready_to_attempt':
+        raise RuntimeError(gate['message'])
+    return predict_arch(image)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as source:
@@ -2754,14 +2807,15 @@ def predict_arch(image_bgr: np.ndarray) -> dict:
         raise ValueError('발 아치 사진 해상도가 너무 낮습니다.')
     with _MODEL_LOCK:
         model = _load_model()
-        # The supplied tkinter viewer loads RGB using PIL before predict().
-        # Keep the same input color ordering here.
-        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        prediction = model.predict(rgb, conf=CONF, device='cpu', verbose=False)[0]
+        # Ultralytics treats numpy.ndarray source images as OpenCV BGR.
+        # Converting to RGB here would swap channels twice and corrupt colors.
+        # PIL input to the original tkinter viewer was RGB; Ultralytics
+        # internally converts PIL to BGR before applying its RGB preprocessing.
+        prediction = model.predict(image_bgr, conf=CONF, device='cpu', verbose=False)[0]
     out = {'status': 'no_detections', 'class_name': None,
            'confidence': None, 'model_task': model.task,
            'score_is_accuracy': False, 'model_unchanged': True,
-           'preview_bgr': image_bgr}
+           'preview_bgr': image_bgr, 'mask_count': 0}
     if prediction.probs is not None:
         scores = prediction.probs.data.cpu().tolist()
         best = int(np.argmax(scores))
@@ -2773,9 +2827,14 @@ def predict_arch(image_bgr: np.ndarray) -> dict:
         best = int(prediction.boxes.conf.argmax().item())
         score = float(prediction.boxes.conf[best].item())
         label = str(prediction.names[int(prediction.boxes.cls[best].item())]).lower()
+        # Original checkpoint is a YOLOv8-seg model (Low / High / Normal).
+        # Draw masks and boxes; do not silently misrepresent it as a
+        # classification-only checkpoint.
+        masks=getattr(prediction, 'masks', None)
+        count=len(masks.data) if masks is not None else 0
         out.update(status='detected' if score >= CONF else 'low_confidence',
                    class_name=label, confidence=round(score, 4),
-                   preview_bgr=prediction.plot())
+                   mask_count=count, preview_bgr=prediction.plot())
     return out
 
 
@@ -2820,13 +2879,41 @@ footer{color:#8290a4;font-size:12px;text-align:center;padding-bottom:45px}
 <main><div class="eyebrow">AUTOMATIC 2D MEASUREMENT</div><h1>체스보드 A4로 시작하는<br>발 치수 분석</h1><p class="lead">발과 체스보드가 인쇄된 A4를 함께 촬영한 사진을 여러 장 업로드하면, 영상처리·색공간·Homography로 2D 투영치수를 계산합니다. 수동으로 꼭짓점을 찍을 필요가 없습니다.</p>
 <div class="note">촬영: 체스보드 A4는 바닥에 그대로 두고, <b>위쪽 사진 2~8장</b>은 거의 수직으로, <b>측면 사진 2~8장</b>은 발 옆에서 찍어 주세요. 사진은 서버 메모리에서 분석하며 저장하지 않습니다. <b>사진 속 기존 체스보드 A4를 그대로 사용하며 다른 인쇄판은 필요하지 않습니다.</b></div>
 <form id="form"><div class="steps"><div class="card"><h2>01 · 위쪽 사진</h2><p class="hint">발볼 폭 추정 · A4 네 모서리가 최대한 보이도록</p><input class="file" name="top" id="top" type="file" accept="image/jpeg,image/png,image/webp" multiple required><p class="hint" id="topCount">최대 8장</p></div>
-<div class="card"><h2>02 · 측면 사진</h2><p class="hint">발 길이 투영 추정 · A4는 바닥에 그대로</p><input class="file" name="side" id="side" type="file" accept="image/jpeg,image/png,image/webp" multiple required><p class="hint" id="sideCount">최대 8장</p></div></div><div class="card"><h2>03 · YOLO 발 아치 판별 (선택)</h2><p class="hint">기존 high / low / normal YOLO 모델을 변경하지 않고 그대로 사용합니다. 발의 아치가 보이는 별도의 사진 1장을 추가할 수 있습니다. 아치 분류는 발 길이·발볼 측정에 영향을 주지 않습니다.</p><input class="file" name="arch" id="arch" type="file" accept="image/jpeg,image/png,image/webp"><p class="hint">YOLO 실행에는 별도의 PyTorch·Ultralytics 설치가 필요합니다. 모델 점수는 실측 정확도가 아닙니다.</p></div><button id="go" type="submit">자동 분석 시작</button></form>
+<div class="card"><h2>02 · 측면 사진</h2><p class="hint">발 길이 투영 추정 · A4는 바닥에 그대로</p><input class="file" name="side" id="side" type="file" accept="image/jpeg,image/png,image/webp" multiple required><p class="hint" id="sideCount">최대 8장</p></div></div><div class="card"><h2>03 · YOLO 발 아치 판별 (선택)</h2><p class="hint">기존 high / low / normal YOLO 모델을 변경하지 않고 그대로 사용합니다. 발의 아치가 보이는 별도의 사진 1장을 추가할 수 있습니다. 아치 분류는 발 길이·발볼 측정에 영향을 주지 않습니다.</p><input class="file" name="arch" id="arch" type="file" accept="image/jpeg,image/png,image/webp"><p class="hint" id="archStatus">YOLO 실행 서버 환경 확인 중...</p><button type="button" id="archOnly" style="background:#285a57">발 아치 사진만 YOLO로 분석</button></div><button id="go" type="submit">자동 분석 시작</button></form>
 <section id="result" style="display:none"><div class="card"><h2>통합 분석 결과</h2><div class="metrics"><div class="metric"><small>발볼 · A4 평면 투영</small><strong id="width">—</strong></div><div class="metric"><small>발 길이 · A4 평면 투영</small><strong id="length">—</strong></div></div><p class="muted" id="summary"></p><div class="error">중요: 길이는 바닥 평면 투영치입니다. 발의 실제 높이·카메라 렌즈·시점으로 인한 시차가 제거되지 않았으므로 <b>실제 신발 사이즈를 확정하는 용도로 사용하면 안 됩니다.</b></div></div>
-<div class="card" id="archSection" style="display:none"><h2>YOLO 발 아치 분류 (별도 분석)</h2><p class="muted" id="archMessage"></p><img id="archPreview" alt="YOLO 발 아치 결과" style="max-width:100%;max-height:360px;object-fit:contain;display:none;border-radius:12px"></div><div class="card"><h2>사진별 자동 검출 진단</h2><div class="grid" id="frames"></div></div></section>
+<div class="card"><h2>사진별 자동 검출 진단</h2><div class="grid" id="frames"></div></div></section><div class="card" id="archSection" style="display:none"><h2>YOLO 발 아치 분류 (별도 분석)</h2><p class="muted" id="archMessage"></p><img id="archPreview" alt="YOLO 발 아치 결과" style="max-width:100%;max-height:360px;object-fit:contain;display:none;border-radius:12px"></div>
 </main><footer>FootFrame Lecture-CV · OpenCV 2D · Checkerboard A4 · Provisional</footer>
 <script>
 const form=document.getElementById('form');const btn=document.getElementById('go');
 for(const kind of ['top','side']) document.getElementById(kind).addEventListener('change',e=>document.getElementById(kind+'Count').textContent=e.target.files.length+'장 선택');
+// Standalone YOLO input is possible without top/side photos.
+function renderArch(a){
+ const panel=document.getElementById('archSection');
+ panel.style.display=a&&a.status!=='not_requested'?'block':'none';
+ if(!a||a.status==='not_requested')return;
+ const label=a.class_name?({high:'높은 아치',low:'낮은 아치',normal:'보통 아치'}[a.class_name]||a.class_name):'판단 보류';
+ const score=a.confidence==null?'':` · YOLO 점수 ${(a.confidence*100).toFixed(1)}% (실제 측정 정확도 아님)`;
+ document.getElementById('archMessage').textContent=a.status==='unavailable'?`YOLO 미실행: ${a.error||'환경을 확인해 주세요.'}`:`${label}${score} · 기존 가중치 사용`;
+ const img=document.getElementById('archPreview');
+ if(a.preview){img.src='data:image/jpeg;base64,'+a.preview;img.style.display='block';}
+ else {img.style.display='none';img.removeAttribute('src');}
+}
+fetch('/arch-status').then(r=>r.json()).then(d=>{
+ document.getElementById('archStatus').textContent=d.status==='ready_to_attempt'
+   ?'YOLO 실행 준비됨 · 모델 추론 여부는 실제 사진으로 확인하세요.'
+   :'YOLO 사용 불가: '+d.message;
+}).catch(()=>{document.getElementById('archStatus').textContent='서버의 YOLO 실행 상태를 확인하지 못했습니다.'});
+document.getElementById('archOnly').addEventListener('click',async()=>{
+ const button=document.getElementById('archOnly');
+ const file=document.getElementById('arch').files[0];
+ if(!file){alert('발 아치 사진 한 장을 선택해 주세요.');return;}
+ const body=new FormData();body.append('arch',file);
+ button.disabled=true;button.textContent='YOLO 아치 분석 중...';
+ try{const response=await fetch('/analyze-arch',{method:'POST',body});const data=await response.json();
+     if(data.arch)renderArch(data.arch);else throw Error(data.error||'YOLO 실행 오류');}
+ catch(error){renderArch({status:'unavailable',error:error.message});}
+ finally{button.disabled=false;button.textContent='발 아치 사진만 YOLO로 분석';}
+});
 form.addEventListener('submit',async e=>{e.preventDefault();const tops=document.getElementById('top').files;const sides=document.getElementById('side').files;
 if(!tops.length||!sides.length||tops.length>8||sides.length>8){alert('위쪽과 측면 사진을 각각 1~8장 선택해 주세요.');return;}
 btn.disabled=true;btn.textContent='사진 분석 중...';
@@ -2834,15 +2921,10 @@ try{const r=await fetch('/analyze',{method:'POST',body:new FormData(form)});cons
 const fmt=x=>x==null?'검출 불확실':x.toFixed(1)+' mm';
 document.getElementById('width').textContent=fmt(data.fusion.width.accepted_mm);
 document.getElementById('length').textContent=fmt(data.fusion.length.accepted_mm);
-document.getElementById('summary').textContent=`발볼 사용 사진 ${data.fusion.width.used_views.length}장 · 발 길이 사용 사진 ${data.fusion.length.used_views.length}장. 유효 사진 사이의 차이는 실제 정확도 증거가 아닙니다.`;
+document.getElementById('summary').textContent=`발볼 사용 사진 ${data.fusion.width.used_views.length}장 · 측면 사진 A4 후보 ${data.side_detection_summary?.paper_candidate_found??0}/${data.side_detection_summary?.total??0}장 · 개별 길이 ${data.side_detection_summary?.individual_length_measured??0}장 · 최종 길이 사용 ${data.fusion.length.used_views.length}장. A4 후보 검출이 실제 종이 외곽과 일치한다는 뜻은 아닙니다.`;
 const referenceWarning=[data.fusion.width,data.fusion.length].some(x=>['unverified_checkerboard_bbox','mixed_verified_and_unverified'].includes(x.reference_status));
 if(referenceWarning)document.getElementById('summary').textContent+=' 일부 사진은 검은 칸을 이용해 A4 외곽을 추정한 것으로 실제 종이 네 모서리의 독립 검증이 없습니다.';
-const a=data.arch;const archPanel=document.getElementById('archSection');archPanel.style.display=a&&a.status!=='not_requested'?'block':'none';
-if(a&&a.status!=='not_requested'){
-const label=a.class_name?({high:'높은 아치',low:'낮은 아치',normal:'보통 아치'}[a.class_name]||a.class_name):'판단 보류';
-const score=a.confidence==null?'':` · YOLO 점수 ${(a.confidence*100).toFixed(1)}% (정확도 아님)`;
-document.getElementById('archMessage').textContent=a.status==='unavailable'?`YOLO 미실행: ${a.error||'분류 환경이 준비되지 않았습니다.'}`:`${label}${score} · 기존 가중치 그대로 사용 · 발 길이·발볼과 독립 분석`;
-const ip=document.getElementById('archPreview');if(a.preview){ip.src='data:image/jpeg;base64,'+a.preview;ip.style.display='block';}else{ip.style.display='none';ip.removeAttribute('src');}}
+renderArch(data.arch);
 const reasonKo={toe_or_heel_at_paper_border:'발가락 또는 뒤꿈치가 A4 경계에 걸려 측정 보류',insufficient_visible_foot:'발 윤곽이 충분히 보이지 않습니다',insufficient_endpoint_support:'발끝 검출 근거 부족',inconsistent_with_verified_paper_view:'외곽 검증 사진과 측정값 불일치',invalid_or_unmeasurable_view:'측정 불가능한 사진',checkerboard_scale_inconsistent:'다른 사진과 체스보드 칸 크기가 일치하지 않아 제외',checkerboard_not_found:'체스보드 검출 실패'};const rko=r=>reasonKo[r]||r||'확인 불가';
 const g=document.getElementById('frames');g.replaceChildren();for(const f of data.frames){const el=document.createElement('div');el.className='frame';const h=document.createElement('h3');h.textContent=(f.source_filename||f.view_id)+' · '+(f.mm==null?'치수 계산 보류':f.mm.toFixed(1)+' mm');const metric=f.kind==='top'?data.fusion.width:data.fusion.length;const isUsed=metric.used_views.includes(f.view_id);const excludedReason=metric.rejected[f.view_id];const t=document.createElement('p');t.className=isUsed?'pill':'pill bad';t.textContent=isUsed?'최종 측정에 사용 · '+rko(f.reason):'최종 측정 제외 · '+rko(f.accepted?excludedReason:f.reason);el.append(h);for(const [label,value] of [['01 · A4 검출',f.overlay],['02 · Homography',f.rectified],['03 · Color Segmentation',f.mask_preview],['04 · 실제 측정선',f.measurement_preview]]){if(!value)continue;const figure=document.createElement('figure');figure.className='stage';const im=new Image();im.src='data:image/jpeg;base64,'+value;im.alt=f.view_id+' '+label;im.loading='lazy';const caption=document.createElement('figcaption');caption.textContent=label;figure.append(im,caption);el.append(figure)}
 const diagnostic=document.createElement('p');diagnostic.className='muted';const quality=f.checker_quality||{};
@@ -2925,7 +3007,7 @@ def process_uploads(top_bytes,side_bytes,arch_bytes=None,*,top_names=None,side_n
     if arch_bytes:
         arch_photo=decode(arch_bytes)
         try:
-            prediction=predict_arch(arch_photo)
+            prediction=predict_arch_checked(arch_photo)
             arch_result={k:v for k,v in prediction.items() if k!='preview_bgr'}
             arch_result['preview']=encode(prediction.get('preview_bgr'))
         except (RuntimeError, ImportError, OSError) as exc:
@@ -2955,8 +3037,50 @@ def process_uploads(top_bytes,side_bytes,arch_bytes=None,*,top_names=None,side_n
         else:
             record['measurement_preview']=None
         frames.append(record)
-    return {'version':'footframe', 'board_profile':'existing_user_checkerboard_a4', 'requires_new_printed_template':False, 'frames':frames,'fusion':res,'same_board_ransac':match_audit, 'arch':arch_result,
+    side_frames=[f for f in frames if f['kind']=='side']
+    side_report={'paper_candidate_found':sum(f['paper_corners'] is not None for f in side_frames),
+                 'individual_length_measured':sum(f['mm'] is not None for f in side_frames),
+                 'accepted_for_final':len(res['length']['used_views']),
+                 'total':len(side_frames),
+                 'warning':'A4 검출이 성공해도 종이 바깥선 오차 또는 사진 간 불일치로 최종 길이 계산에서 제외될 수 있습니다.'}
+    return {'side_detection_summary':side_report, 'version':'footframe', 'board_profile':'existing_user_checkerboard_a4', 'requires_new_printed_template':False, 'frames':frames,'fusion':res,'same_board_ransac':match_audit, 'arch':arch_result,
             'disclaimer':'Lecture-based 2D projected estimates. Checkerboard bounding boxes are NOT physically calibrated printed patterns and do NOT verify outer A4 corners.'}
+
+
+def process_arch_only(raw: bytes) -> dict:
+    """A YOLO request must not depend on uploading top/side CV photos."""
+    if not 100 < len(raw) <= MAX_IMAGE_BYTES:
+        raise ValueError('발 아치 사진이 비어 있거나 용량 제한을 초과했습니다.')
+    # Same reduced-decode preflight as the existing web path.
+    encoded=np.frombuffer(raw, np.uint8)
+    small=cv2.imdecode(encoded, cv2.IMREAD_REDUCED_COLOR_8)
+    if small is None or min(small.shape[:2])<15:
+        raise ValueError('이미지를 읽을 수 없습니다.')
+    if (small.shape[0]*small.shape[1]*64 > MAX_DECODED_IMAGE_PIXELS+60_000
+            or max(small.shape[:2])*8 > MAX_DECODED_SIDE+8):
+        raise ValueError('이미지 해상도가 너무 큽니다.')
+    full=cv2.imdecode(encoded,cv2.IMREAD_COLOR)
+    if full is None or min(full.shape[:2])<120:
+        raise ValueError('유효한 아치 사진이 필요합니다.')
+    image=resize_image(full)
+    try:
+        result=predict_arch_checked(image)
+        preview=result.pop('preview_bgr',None)
+        if preview is not None:
+            h,w=preview.shape[:2]
+            if max(h,w)>650:
+                scale=650/max(h,w)
+                preview=cv2.resize(preview,(round(w*scale),round(h*scale)),interpolation=cv2.INTER_AREA)
+            ok,jpg=cv2.imencode('.jpg', preview,[cv2.IMWRITE_JPEG_QUALITY, 67])
+            result['preview']=base64.b64encode(jpg.tobytes()).decode('ascii') if ok else None
+        else:
+            result['preview']=None
+        return result
+    except (RuntimeError,ImportError,OSError) as exc:
+        return dict(status='unavailable', error=str(exc),class_name=None,
+                    confidence=None, model_unchanged=True,
+                    score_is_accuracy=False,preview=None,
+                    diagnostic=arch_capability())
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -2973,17 +3097,53 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.path in ('/','/index.html'):
             self.send_data(200,HTML,'text/html; charset=utf-8')
         elif self.path=='/health':
-            self.send_data(200,json.dumps({'status':'ok','version':'footframe'}),'application/json; charset=utf-8')
+            self.send_data(200,json.dumps({'status':'ok','version':'footframe',
+                                            'arch':arch_capability()}),
+                           'application/json; charset=utf-8')
+        elif self.path=='/arch-status':
+            self.send_data(200,json.dumps(arch_capability(),ensure_ascii=False),
+                           'application/json; charset=utf-8')
         else:self.send_data(404,'Not found','text/plain')
     def do_POST(self):
-        if self.path!='/analyze':return self.send_data(404,'Not found','text/plain')
+        if self.path not in ('/analyze','/analyze-arch'):
+            return self.send_data(404,'Not found','text/plain')
         if not _ANALYSIS_SLOT.acquire(blocking=False):
             return self.send_data(503,json.dumps({'error':'현재 다른 사진을 분석 중입니다. 잠시 후 다시 요청해 주세요.'},ensure_ascii=False),
                                   'application/json; charset=utf-8')
         try:
-            self._process_analyze_request()
+            if self.path=='/analyze-arch':
+                self._process_arch_request()
+            else:
+                self._process_analyze_request()
         finally:
             _ANALYSIS_SLOT.release()
+
+    def _process_arch_request(self):
+        try:
+            clen=int(self.headers.get('Content-Length','0'))
+            if not 0<clen<MAX_IMAGE_BYTES+100_000:
+                raise ValueError('업로드 용량 제한을 초과했습니다.')
+            ctype=self.headers.get('Content-Type','')
+            if 'multipart/form-data' not in ctype:
+                raise ValueError('multipart/form-data 형식이 필요합니다.')
+            message=BytesParser(policy=default).parsebytes(
+                ('Content-Type: '+ctype+'\r\nMIME-Version: 1.0\r\n\r\n').encode('ascii')
+                +self.rfile.read(clen))
+            images=[part.get_payload(decode=True) or b'' for part in message.iter_parts()
+                    if part.get_param('name',header='content-disposition')=='arch']
+            if len(images)!=1:
+                raise ValueError('YOLO 분석용 발 아치 사진 한 장을 선택해 주세요.')
+            result=process_arch_only(images[0])
+            status=503 if result.get('status')=='unavailable' else 200
+            self.send_data(status,json.dumps({'arch':result},ensure_ascii=False),
+                           'application/json; charset=utf-8')
+        except (ValueError,cv2.error) as exc:
+            self.send_data(400,json.dumps({'error':str(exc)},ensure_ascii=False),
+                           'application/json; charset=utf-8')
+        except Exception:
+            traceback.print_exc()
+            self.send_data(500,json.dumps({'error':'YOLO 실행 중 서버 내부 오류'},ensure_ascii=False),
+                           'application/json; charset=utf-8')
 
     def _process_analyze_request(self):
         try:
